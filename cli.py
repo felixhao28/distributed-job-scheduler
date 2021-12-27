@@ -9,7 +9,15 @@ from typing import List
 import time
 import threading
 import pickle
+import traceback
 from argparse import ArgumentParser
+
+
+def dumper(obj):
+    try:
+        return obj.toJSON()
+    except:
+        return obj.__dict__
 
 
 class ServerContext:
@@ -20,11 +28,12 @@ class ServerContext:
 
     def __init__(self, data_dir: str, logs_dir: str) -> None:
         self.slaves = []  # type: List[Slave]
-        self.job_waitlist = deque()  # type: deque
+        self.job_waitlist = deque()  # type: deque[List[str]]
         self.lock = threading.RLock()
         self.should_stop = False
         self.logs_dir = logs_dir
-        self._server_context_file = os.path.join(data_dir, "server_context.pkl")
+        self._server_context_file = os.path.join(
+            data_dir, "server_context.pkl")
         self._load()
 
     def add_job(self, args: List[str]):
@@ -37,9 +46,24 @@ class ServerContext:
             E.g. ["job.sh", "data.txt", "data2.txt"] will be run as "./job.sh data.txt data2.txt".
         """
         with self.lock:
-            self.job_waitlist.put(args)
+            self.job_waitlist.append(args)
             self._save()
-            self.schedule()
+            slave = self.schedule()
+            if len(self.job_waitlist) > 0:
+                return {"msg": "All slaves are busy. Job is added to the waiting list."}
+            elif slave is not None:
+                return {"msg": f"Job is asigned to {slave.ip}."}
+            else:
+                return {"msg": "ServerContext.add_job: This should never be reached."}
+
+    def remove_job(self, args: List[str]):
+        with self.lock:
+            try:
+                self.job_waitlist.remove(args)
+                self._save()
+                return {"msg": "The job is removed from waitlist"}
+            except Exception as e:
+                return {"msg": f"Failed to remove the job from waitlist: {str(e)}"}
 
     def add_slave(self, ip: str):
         """Register a slave
@@ -48,9 +72,13 @@ class ServerContext:
             ip (str): The IP address of that slave. Make sure it does not require password authentication when SSH into it.
         """
         with self.lock:
+            for slave in self.slaves:
+                if slave.ip == ip:
+                    return {"err": f"{ip} is already added"}
             self.slaves.append(Slave(ip, self))
             self._save()
             self.schedule()
+        return {"msg": "ok"}
 
     def _save(self):
         with self.lock, open(self._server_context_file, "wb") as out_file:
@@ -66,11 +94,15 @@ class ServerContext:
 
     def shutdown(self):
         self._save()
+        self.should_stop = True
+        for slave in self.slaves:
+            slave.shutdown()
 
     def schedule(self):
         """Schedule waiting jobs to idle slaves.
         Be careful this method will be called from different threads.
         """
+        slave = None
         with self.lock:
             while len(self.job_waitlist) > 0:
                 hasIdleSlave = False
@@ -79,18 +111,20 @@ class ServerContext:
                         hasIdleSlave = True
                         job = self.job_waitlist.popleft()
                         slave.run(job)
+                        break
                 if not hasIdleSlave:
                     break
+        return slave
 
-    def to_JSON(self):
-        return json.dumps({
+    def toJSON(self):
+        return {
             "job_waitlist": list(self.job_waitlist),
             "slaves": [{
                 "ip": slave.ip,
                 "status": slave.status,
                 "running_job": slave.running_job,
             } for slave in self.slaves]
-        })
+        }
 
 
 def check_pid(pid):
@@ -119,7 +153,7 @@ class JobInfo:
         return f"""Job {self.id}: {alive_status}
     Script: {self.script}
     Last 10 lines of {self.log_file}:
-    {subprocess.run(f"tail -n 10 {self.log_file}", shell=True).stdout.decode("utf-8")}
+    {subprocess.run(["tail", "-n", "10", self.log_file]).stdout.decode("utf-8")}
 """
 
 
@@ -146,13 +180,18 @@ class Slave:
         logging.info(
             f"Running job {job_id} on {self.ip} > {self.ctx.logs_dir}/job_{job_id}")
         logging.info(" ".join(job_script))
-        t = threading.Thread(name=f"Worker {self.ip} {job_id}", target=_worker, args=[
-                             job_id, job_script, self])
-        t.start()
-        logging.info(
-            f"Finished job {job_id} on {self.ip} > {self.ctx.logs_dir}/job_{job_id}")
+        subprocess.run(["mkdir", "-p", self.ctx.logs_dir])
+        log_file = os.path.join(self.ctx.logs_dir, f"job_{job_id}.txt")
+        log_file = log_file.replace(" ", "\\ ")
+        proc = subprocess.Popen(" ".join(job_script) + f" >{log_file} 2>&1", env={
+            "JOB_ID": job_id,
+            "SLAVE_IP": self.ip
+        }, shell=True, start_new_session=True)
+        self.running_job = JobInfo(job_id, job_script, proc.pid, log_file)
+        self.monitor(proc)
+        self.ctx._save()
 
-    def monitor(self):
+    def monitor(self, proc=None):
         """Start a monitoring thread if there is a running job.
         The monitering thread will reset the slave's states Once the job is finished.
         """
@@ -160,7 +199,7 @@ class Slave:
             pid = self.running_job.pid
             self.process_waiter = threading.Thread(
                 name=f"Job waiter {self.ip} {self.running_job.id}",
-                target=_process_waiter, args=[pid, self])
+                target=_process_waiter, args=[pid, self, proc])
             self.process_waiter.start()
 
     def shutdown(self):
@@ -174,6 +213,7 @@ class Slave:
     def __setstate__(self, state):
         """Make sure to call Slave.associate afterwards"""
         self.ip, self.status, self.running_job = state
+        self.ctx = None
 
     def associate(self, ctx: ServerContext):
         """Associate this slave to a server context object. Only used after loading the server context object from file.
@@ -181,33 +221,30 @@ class Slave:
         Args:
             ctx (ServerContext): The Server context object.
         """
+        if self.ctx is not None:
+            logging.error("A slave can only be associated once.")
+            return
         self.process_waiter = None
         self.ctx = ctx
+        self._shutdown_event = threading.Event()
         self.monitor()
 
 
-def _process_waiter(pid, slave: Slave):
+def _process_waiter(pid, slave: Slave, proc: subprocess.Popen):
     while check_pid(pid):
+        if proc is not None and proc.poll() != None:
+            break
         if slave._shutdown_event.wait(1):
             # slave is shutting down, keep its inner states intact for serialization later
             return
 
+    logging.info(
+        f"Finished job {slave.running_job.id} on {slave.ip} > {slave.running_job.log_file}")
     slave.status = "idle"
     slave.process_waiter = None
     slave.running_job = None
+    slave.ctx._save()
     slave.ctx.schedule()
-
-
-def _worker(job_id, job_script, slave: Slave):
-    subprocess.run("mkdir -p jobs", shell=True)
-    log_file = os.path.join("jobs", f"job_{job_id}.txt")
-    with open(log_file, "wb") as out:
-        proc = subprocess.Popen(job_script, stdout=out, stderr=subprocess.STDOUT, env={
-            "JOB_ID": job_id,
-            "SLAVE_IP": slave.ip
-        }, start_new_session=True)
-        slave.running_job = JobInfo(job_id, job_script, proc.pid, log_file)
-        slave.monitor()
 
 
 def start(base_parser):
@@ -217,13 +254,13 @@ def start(base_parser):
     args = parser.parse_args()
     data_dir = args.server_data_dir
     logs_dir = args.log_dir
-    subprocess.run(f"mkdir -p {data_dir}", shell=True)
+    subprocess.run(["mkdir", "-p", data_dir])
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     pid_file_path = os.path.join(data_dir, "service_pid")
 
     def ensure_fifo():
         if not os.path.exists(commands_fifo_path):
-            subprocess.run(f"mkfifo {commands_fifo_path}", shell=True)
+            subprocess.run(["mkfifo", commands_fifo_path])
 
     if os.path.exists(commands_fifo_path):
         try:
@@ -233,7 +270,7 @@ def start(base_parser):
                 logging.error(
                     "`commands_fifo` already exists in this folder. Try shutting down the already running server with `python3 cli.py stop`")
                 sys.exit(-1)
-            subprocess.run(f"rm -f {commands_fifo_path}", shell=True)
+            subprocess.run(["rm", "-f", commands_fifo_path])
         except:
             pass
 
@@ -242,12 +279,14 @@ def start(base_parser):
     logging.info(f"Handling existing tasks")
     logging.info(f"Server started")
 
-    ctx = ServerContext(logs_dir)
+    ctx = ServerContext(data_dir, logs_dir)
 
     ensure_fifo()
-    threading.Thread(name="print status", target=status, args=[base_parser]).start()
+    threading.Thread(name="print status", target=status,
+                     args=[base_parser]).start()
 
-    while True:
+    ctx.schedule()
+    while not ctx.should_stop:
         ensure_fifo()
         with open(commands_fifo_path, "r", encoding="utf-8") as f:
             try:
@@ -255,20 +294,56 @@ def start(base_parser):
             except:
                 logging.error("Error parsing json from stream")
                 continue
-            if cmd['type'] == 'shutdown':
-                break
-            elif cmd['type'] == 'addjob':
-                ctx.add_job(cmd['args'])
-            elif cmd['type'] == 'addslave':
-                ctx.add_slave(cmd['ip'])
-            elif cmd['type'] == 'status':
-                fifo_name = cmd['pipe']
+            fifo_name = cmd['pipe'] if 'pipe' in cmd else None
+            try:
+                if cmd['type'] == 'shutdown':
+                    logging.info(f"Shutting down")
+                    ctx.shutdown()
+                    resp = {"msg": "Stopped"}
+                elif cmd['type'] == 'add_job':
+                    resp = ctx.add_job(cmd['args'])
+                elif cmd['type'] == 'add_slave':
+                    resp = ctx.add_slave(cmd['ip'])
+                elif cmd['type'] == 'status':
+                    resp = ctx.toJSON()
+                elif cmd['type'] == 'remove_job':
+                    resp = ctx.remove_job(cmd['args'])
+                else:
+                    resp = {"err": f"Unknown command type {cmd['type']}"}
+            except Exception as err:
+                traceback.print_exc()
+                resp = {"err": str(err)}
+            if fifo_name is not None:
                 with open(fifo_name, "w", encoding="utf-8") as f:
-                    f.write(ctx.to_JSON() + "\n")
-            else:
-                logging.error(f"Unknown command type {cmd['type']}")
-    logging.info(f"Shutting down")
-    ctx.shutdown()
+                    f.write(json.dumps(resp, default=dumper) + "\n")
+
+
+class Fifo:
+    def __init__(self, data_dir) -> None:
+        id = str(int(time.time() * 1000))
+        self.fifo_name = os.path.join(data_dir, f"tmp_{id}")
+        if os.path.exists(self.fifo_name):
+            subprocess.run(["rm", "-f", self.fifo_name])
+        subprocess.run(["mkfifo", self.fifo_name])
+
+    def done(self):
+        with open(self.fifo_name, "r", encoding="utf-8") as f:
+            resp = json.loads(f.readline())
+        subprocess.run(["rm", "-f", self.fifo_name])
+        if "err" in resp:
+            logging.error(resp["err"])
+            return None
+        if "msg" in resp:
+            logging.info(resp["msg"])
+        return resp
+
+
+def communicate(data_dir, commands_fifo_path, obj):
+    fifo = Fifo(data_dir)
+    obj["pipe"] = fifo.fifo_name
+    with open(commands_fifo_path, "w", encoding="utf-8") as f:
+        f.write(json.dumps(obj) + "\n")
+    return fifo.done()
 
 
 def stop(parser: ArgumentParser):
@@ -280,10 +355,9 @@ def stop(parser: ArgumentParser):
             "{commands_fifo_path} does not exists. Try starting a server with `python3 cli.py start`")
         sys.exit(-1)
 
-    with open(commands_fifo_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "type": "shutdown"
-        }) + "\n")
+    communicate(data_dir, commands_fifo_path, {
+        "type": "shutdown"
+    })
 
 
 def add_job(parser: ArgumentParser):
@@ -296,7 +370,7 @@ def add_job(parser: ArgumentParser):
         sys.exit(-1)
 
     if len(rest_args) == 0:
-        logging.error("Usage: addjob <template.sh> [arg1] [arg2] ...")
+        logging.error("Usage: add_job <template.sh> [arg1] [arg2] ...")
         sys.exit(-1)
 
     if not os.path.isfile(rest_args[0]):
@@ -306,17 +380,38 @@ def add_job(parser: ArgumentParser):
     if not rest_args[0].startswith("./"):
         rest_args[0] = "./" + rest_args[0]
 
-    with open("commands_fifo", "w", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "type": "addjob",
-            "args": rest_args
-        }) + "\n")
+    communicate(data_dir, commands_fifo_path, {
+        "type": "add_job",
+        "args": rest_args
+    })
+
+
+def remove_job(parser: ArgumentParser):
+    args, rest_args = parser.parse_known_args()
+    data_dir = args.server_data_dir
+    commands_fifo_path = os.path.join(data_dir, "commands_fifo")
+    if not os.path.exists(commands_fifo_path):
+        logging.error(
+            "{commands_fifo_path} does not exists. Try starting a server with `python3 cli.py start`")
+        sys.exit(-1)
+
+    if len(rest_args) == 0:
+        logging.error("Usage: remove_job <template.sh> [arg1] [arg2] ...")
+        sys.exit(-1)
+
+    if not rest_args[0].startswith("./"):
+        rest_args[0] = "./" + rest_args[0]
+
+    communicate(data_dir, commands_fifo_path, {
+        "type": "remove_job",
+        "args": rest_args
+    })
 
 
 def add_slave(parser: ArgumentParser):
     parser = ArgumentParser(description="Add a slave.", parents=[parser])
     parser.add_argument("ip", type=str, nargs='+',
-                        required=True, help="IP addresses of the slaves")
+                        help="IP addresses of the slaves")
     args = parser.parse_args()
     data_dir = args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
@@ -325,18 +420,18 @@ def add_slave(parser: ArgumentParser):
             "{commands_fifo_path} does not exists. Try starting a server with `python3 cli.py start`")
         sys.exit(-1)
 
-    with open(commands_fifo_path, "w", encoding="utf-8") as f:
-        for ip in args.ip:
-            p = subprocess.run(
-                f"ssh -o PasswordAuthentication=no {ip} /bin/true", shell=True)
-            if p.returncode != 0:
-                logging.error(
-                    f"Password login is still required for ssh {ip}. Please ensure no password is needed to ssh into {ip}.")
-                sys.exit(-1)
-            f.write(json.dumps({
-                "type": "addslave",
-                "ip": ip
-            }) + "\n")
+    for ip in args.ip:
+        p = subprocess.run(
+            ["ssh", "-o", "PasswordAuthentication=no", ip, "/bin/true"])
+        if p.returncode != 0:
+            logging.error(
+                f"Password login is still required for ssh {ip}. Please ensure no password is needed to ssh into {ip}.")
+            sys.exit(-1)
+
+        communicate(data_dir, commands_fifo_path, {
+            "type": "add_slave",
+            "ip": ip,
+        })
 
 
 def status(parser: ArgumentParser):
@@ -348,30 +443,22 @@ def status(parser: ArgumentParser):
             "{commands_fifo_path} does not exists. Try starting a server with `python3 cli.py start`")
         sys.exit(-1)
 
-    id = str(int(time.time() * 1000))
-    fifo_name = f"tmp_{id}"
-    subprocess.run(f"mkfifo {fifo_name}", shell=True)
-    with open(commands_fifo_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps({
-            "type": "status",
-            "pipe": fifo_name
-        }) + "\n")
-    with open(fifo_name, "r", encoding="utf-8") as f:
-        status = json.loads(f.readline())
-    subprocess.run(f"rm -f {fifo_name}", shell=True)
-    print(json.dumps(status, ensure_ascii=False, indent=2))
+    resp = communicate(data_dir, commands_fifo_path, {
+        "type": "status",
+    })
+    print(json.dumps(resp, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
     parser = ArgumentParser(
         description="Scheduler service command line interface.", add_help=False)
     parser.add_argument("action", type=str, default="status",
-                        help="One of start/stop/status/addjob/addslave")
+                        help="One of start/stop/status/add_job/add_slave")
     parser.add_argument("--server_data_dir", type=str, default=".data")
-    
+
     main_parser = ArgumentParser(parents=[parser])
 
-    args = main_parser.parse_args()
+    args, _ = main_parser.parse_known_args()
     action = args.action
     logging.basicConfig(level=logging.INFO)
     if action == "status":
@@ -380,9 +467,11 @@ if __name__ == "__main__":
         start(parser)
     elif action == "stop":
         stop(parser)
-    elif action == "addjob":
+    elif action == "add_job":
         add_job(parser)
-    elif action == "addslave":
+    elif action == "remove_job":
+        remove_job(parser)
+    elif action == "add_slave":
         add_slave(parser)
     else:
         parser.print_help()
