@@ -1,4 +1,4 @@
-#! /usr/bin/python3
+#!/usr/bin/env python3
 import sys
 import subprocess
 import os
@@ -412,6 +412,8 @@ def add_slave(parser: ArgumentParser):
     parser = ArgumentParser(description="Add a slave.", parents=[parser])
     parser.add_argument("ip", type=str, nargs='+',
                         help="IP addresses of the slaves")
+    parser.add_argument("--skip_ssh_auth_check", action="store_true",
+                        help="Whether to skip the check of slave supporting ssh no-password authentication.")
     args = parser.parse_args()
     data_dir = args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
@@ -421,12 +423,13 @@ def add_slave(parser: ArgumentParser):
         sys.exit(-1)
 
     for ip in args.ip:
-        p = subprocess.run(
-            ["ssh", "-o", "PasswordAuthentication=no", ip, "/bin/true"])
-        if p.returncode != 0:
-            logging.error(
-                f"Password login is still required for ssh {ip}. Please ensure no password is needed to ssh into {ip}.")
-            sys.exit(-1)
+        if not args.skip_ssh_auth_check:
+            p = subprocess.run(
+                ["ssh", "-o", "PasswordAuthentication=no", ip, "/bin/true"])
+            if p.returncode != 0:
+                logging.error(
+                    f"Password login is still required for ssh {ip}. Please ensure no password is needed to ssh into {ip}.")
+                sys.exit(-1)
 
         communicate(data_dir, commands_fifo_path, {
             "type": "add_slave",
