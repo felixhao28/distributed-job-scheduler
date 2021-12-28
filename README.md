@@ -6,11 +6,11 @@ Main features:
 
 1. The scheduler manages a list of workers. It automatically assigns jobs to idle workers.
 1. Uses a user-written customizable script to manage job distribution and collection.
-1. User can add new jobs or workers on the fly.
-1. The scheduler saves and loads workers and jobs' state automatically. User does not need to reconfigure the schedular every time.
+1. The user can add new jobs or workers on the fly.
+1. The scheduler saves and loads the states of the workers and the jobs automatically. The user does not need to reconfigure the schedular every time.
 1. It is just one Python source file without any dependencies.
 
-A typical use case is copying many data files into multiple machines for process, and then gather the processed files back.
+A typical use case is distributing data files into multiple machines for data processing, and then gathering the processed files back.
 
 ## Installation
 
@@ -20,10 +20,10 @@ Download [cli.py](./cli.py).
 
 ### Write a job script
 
-A job script handles everything including copying files between the scheduler machine and workers, preparing the environment in the workers, and running the job itself.
-Your job script will be run with two environment variables: `JOB_ID` and `SLAVE_IP`. `JOB_ID` is a unique id of the job, you can use that to name temporary files. `SLAVE_IP` is the host name (or IP address) of a worker.
+A job script handles copying files between the scheduler machine and workers, preparing the environment of the workers, and running the job itself.
+Your job script will be run with two environment variables: `JOB_ID` and `SLAVE_IP`. `JOB_ID` is a unique id of the job, which you can use to name temporary files. `SLAVE_IP` is the hostname (or IP address) of a worker.
 
-Typically, a job script will contain three parts: preparing the environment, running the job, collection the results.
+Typically, a job script will contain three parts: preparing the environment, running the job, collecting the results.
 
 ```bash
 #! /bin/bash
@@ -53,7 +53,7 @@ An more robust (supports cancellation and handles errors) exmaple of job script 
 ```
 
 `server_data_dir` needs to be unique for each scheduler instance. And **every other command needs to specify the same `server_data_dir`**.
-It is recommended to run it in background:
+The scheduler works best in the background:
 
 ```bash
 # Use nohup
@@ -79,14 +79,14 @@ Example:
 ./cli.py add_slave 192.168.1.199 192.168.1.200 192.168.1.201
 ```
 
-Since you have the full control of the job script, you don't have to use IP addresses. However it needs to be unique for each worker.
+Since you have the full control of the job script, you don't have to use IP addresses. However, it needs to be unique for each worker.
 In this case, `--skip_ssh_auth_check` is required to skip the SSH no-password check.
 
 Note: you cannot interact with your job script in the command line. So it is best to [ensure no password is needed to ssh into the worker](https://www.ssh.com/academy/ssh/copy-id).
 
 ### Add jobs
 
-A job consists a script name and its arguments.
+A job consists of the script name and its arguments.
 
 ```bash
 ./cli.py add_job <script> <args1> <args2> ...
@@ -98,9 +98,9 @@ Example
 ./cli.py add_job job_script.sh data_1
 ```
 
-Each time a job is added or a worker becomes idle, the scheduler will try to assign a job to an idle worker from the waiting list.
+Each time a job is added or a worker becomes idle, the scheduler will assign a job from the waiting list to an idle worker.
 
-If all workers are busy, the job will be added to a waiting list. Jobs in the waiting list can be removed specifying the same script and arguments.
+If all workers are busy, the scheduler will add the job to a waiting list. The user can remove jobs in the waiting list by specifying the same script and arguments.
 If multiple jobs share the same script and arguments, all of them will be removed.
 
 ```bash
@@ -109,7 +109,7 @@ If multiple jobs share the same script and arguments, all of them will be remove
 
 ### Check the status
 
-This prints all the waiting jobs and workers' status.
+This prints the status of all the awaiting jobs and workers to the console.
 
 ```bash
 ./cli.py status
@@ -122,4 +122,4 @@ This prints all the waiting jobs and workers' status.
 ```
 
 Stopping the server does not kill all running jobs. It will just kill the scheduler.
-The running jobs will continue to run, but no more schduling will be done until the scheduler is started again.
+The running jobs will continue to run, but there will be no more scheduling until you start the scheduler again.
