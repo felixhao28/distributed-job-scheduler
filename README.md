@@ -56,7 +56,7 @@ An more robust (supports cancellation and handles errors) exmaple of job script 
 It is recommended to run it in background:
 
 ```bash
-# User nohup
+# Use nohup
 nohup ./cli.py &
 # Or use screen
 screen -S scheduler
@@ -107,7 +107,7 @@ If multiple jobs share the same script and arguments, all of them will be remove
 ./cli.py remove_job <script> <args1> <args2> ...
 ```
 
-### Checking the status
+### Check the status
 
 This prints all the waiting jobs and workers' status.
 
