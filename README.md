@@ -47,7 +47,7 @@ An more robust (supports cancellation and handles errors) exmaple of job script 
 ### Start the server
 
 ```bash
-./cli.py start [<server_data_dir>] [<log_dir>]
+./cli.py start [--server_data_dir=<server_data_dir>] [--log_dir=<log_dir>]
 # server_data_dir is by default ".data"
 # log_dir is by default "logs"
 ```
