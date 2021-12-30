@@ -84,6 +84,15 @@ In this case, `--skip_ssh_auth_check` is required to skip the SSH no-password ch
 
 Note: you cannot interact with your job script in the command line. So it is best to [ensure no password is needed to ssh into the worker](https://www.ssh.com/academy/ssh/copy-id).
 
+You can remove workers with this command:
+
+```bash
+./cli.py remove_slave [--wait|kill] <ip_1> [<ip_2>] ...
+```
+
+If the worker is busy, `--wait` will postpone the removal until the job is finished. `--kill` in constrast will kill the running job and remove the worker immediately.
+It is your responsibility to handle the `SIGTERM` signal in your script to stop the job completely. A such example is [example_job.sh](./example_job.sh).
+
 ### Add jobs
 
 A job consists of the script name and its arguments.
@@ -107,13 +116,60 @@ If multiple jobs share the same script and arguments, all of them will be remove
 ./cli.py remove_job <script> <args1> <args2> ...
 ```
 
-### Check the status
+### Check/load the status
 
 This prints the status of all the awaiting jobs and workers to the console.
 
 ```bash
 ./cli.py status
 ```
+
+It prints a json object like this:
+
+```json
+{
+    "job_waitlist": [
+        ["example_job.sh", "file3"]
+        ["example_job.sh", "file4"]
+    ],
+    "slaves": [
+        {
+            "ip": "111.111.111.111",
+            "status": "busy",
+            "running_job": {
+                "id": "1640569405834",
+                "script": [
+                    "./example_job.sh",
+                    "file1"
+                ],
+                "pid": 26765,
+                "log_file": "logs/job_1640569405834.txt"
+            }
+        },
+        {
+            "ip": "111.111.111.112",
+            "status": "busy",
+            "running_job": {
+                "id": "1640601291867",
+                "script": [
+                    "./example_job.sh",
+                    "file2"
+                ],
+                "pid": 26767,
+                "log_file": "logs/job_1640601291867.txt"
+            }
+        }
+    ]
+}
+```
+
+In case of needing manually editing the status of the scheduler, save the above json into a file, edit it, and then load it with `load_status` action.
+
+```bash
+./cli.py load_status </path/to/status_json_file>
+```
+
+Note: this will erase the existing status of the scheduler.
 
 ### Stop the server
 
@@ -123,3 +179,7 @@ This prints the status of all the awaiting jobs and workers to the console.
 
 Stopping the server does not kill all running jobs. It will just kill the scheduler.
 The running jobs will continue to run, but there will be no more scheduling until you start the scheduler again.
+
+## Troubleshooting
+
+If the scheduler is not behaving properly. You can reset the scheduler by deleting the `<server_data_dir>` folder (`.data` by default) and restarting the scheduler.

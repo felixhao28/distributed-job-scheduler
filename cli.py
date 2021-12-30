@@ -80,6 +80,60 @@ class ServerContext:
             self.schedule()
         return {"msg": "ok"}
 
+    def remove_slave(self, ip: str, options: dict):
+        """Remove a slave
+
+        Args:
+            ip (str): The IP address of that slave.
+        """
+        with self.lock:
+            new_list = []
+            removed = False
+            for slave in self.slaves:
+                if slave.ip == ip:
+                    removed = True
+                    if slave.status == "idle":
+                        # remove it
+                        continue
+                    else:
+                        if slave.remove_after_finish:
+                            raise Exception("This slave is already marked for removal. Use --kill to remove it immediate or wait for the job to finish.")
+                        if options["wait"]:
+                            slave.remove_after_finish = True
+                        elif options["kill"]:
+                            pid = slave.running_job.pid
+                            slave._shutdown_event.set()
+                            slave.process_waiter.join()
+                            os.kill(pid)
+                            continue
+                        else:
+                            raise Exception("This slave is currently busy. Use --wait or --kill to remove it.")
+                new_list.append(slave)
+            self.slaves = new_list
+            self._save()
+        if removed:
+            return {"msg": "ok"}
+        else:
+            return {"msg": f"Cannot find the specific slave with {ip}"}
+
+    def load_status(self, file):
+        with open(file, "r", encoding="utf-8") as f:
+            j = json.load(f)
+        self.job_waitlist = deque(j["job_waitlist"])
+        self.slaves = []
+        for slave in j["slaves"]:
+            s = Slave(slave["ip"], self)
+            s.status = slave["status"]
+            if "remove_after_finish" in slave:
+                s.remove_after_finish = slave["remove_after_finish"]
+            job_info = slave["running_job"]
+            if job_info is not None:
+                s.running_job = JobInfo(job_info["id"], job_info["script"], job_info["pid"], job_info["log_file"])
+                s.monitor()
+            self.slaves.append(s)
+        self._save()
+        return {"msg": "ok"}
+
     def _save(self):
         with self.lock, open(self._server_context_file, "wb") as out_file:
             pickle.dump((self.slaves, self.job_waitlist), out_file)
@@ -123,6 +177,7 @@ class ServerContext:
                 "ip": slave.ip,
                 "status": slave.status,
                 "running_job": slave.running_job,
+                **({"remove_after_finish": slave.remove_after_finish} if slave.remove_after_finish else {})
             } for slave in self.slaves]
         }
 
@@ -164,6 +219,7 @@ class Slave:
         self.running_job = None  # type: JobInfo
         self.ctx = ctx
         self.process_waiter = None
+        self.remove_after_finish = False
         self._shutdown_event = threading.Event()
 
     def run(self, job_script: List[str]):
@@ -208,11 +264,15 @@ class Slave:
             self.process_waiter.join()
 
     def __getstate__(self):
-        return (self.ip, self.status, self.running_job)
+        return (self.ip, self.status, self.running_job, self.remove_after_finish)
 
     def __setstate__(self, state):
         """Make sure to call Slave.associate afterwards"""
-        self.ip, self.status, self.running_job = state
+        if len(state) == 3:
+            self.ip, self.status, self.running_job = state
+            self.remove_after_finish = False
+        elif len(state) == 4:
+            self.ip, self.status, self.running_job, self.remove_after_finish = state
         self.ctx = None
 
     def associate(self, ctx: ServerContext):
@@ -240,9 +300,13 @@ def _process_waiter(pid, slave: Slave, proc: subprocess.Popen):
 
     logging.info(
         f"Finished job {slave.running_job.id} on {slave.ip} > {slave.running_job.log_file}")
-    slave.status = "idle"
     slave.process_waiter = None
     slave.running_job = None
+    if slave.remove_after_finish:
+        slave.ctx.slaves.remove(slave)
+        slave.status = "removed"
+    else:
+        slave.status = "idle"
     slave.ctx._save()
     slave.ctx.schedule()
 
@@ -308,6 +372,10 @@ def start(base_parser):
                     resp = ctx.toJSON()
                 elif cmd['type'] == 'remove_job':
                     resp = ctx.remove_job(cmd['args'])
+                elif cmd['type'] == 'remove_slave':
+                    resp = ctx.remove_slave(cmd['ip'], cmd['options'])
+                elif cmd['type'] == 'load_status':
+                    resp = ctx.load_status(cmd['file'])
                 else:
                     resp = {"err": f"Unknown command type {cmd['type']}"}
             except Exception as err:
@@ -342,7 +410,7 @@ def communicate(data_dir, commands_fifo_path, obj):
     fifo = Fifo(data_dir)
     obj["pipe"] = fifo.fifo_name
     with open(commands_fifo_path, "w", encoding="utf-8") as f:
-        f.write(json.dumps(obj) + "\n")
+        f.write(json.dumps(obj, default=dumper) + "\n")
     return fifo.done()
 
 
@@ -437,6 +505,37 @@ def add_slave(parser: ArgumentParser):
         })
 
 
+def remove_slave(parser: ArgumentParser):
+    parser = ArgumentParser(description="Remove a slave.", parents=[parser])
+    parser.add_argument("ip", type=str, nargs='+',
+                        help="IP addresses of the slaves")
+    parser.add_argument("--wait", action="store_true")
+    parser.add_argument("--kill", action="store_true")
+    args = parser.parse_args()
+    data_dir = args.server_data_dir
+    commands_fifo_path = os.path.join(data_dir, "commands_fifo")
+    if not os.path.exists(commands_fifo_path):
+        logging.error(
+            "{commands_fifo_path} does not exists. Try starting a server with `python3 cli.py start`")
+        sys.exit(-1)
+
+    if args.wait and args.kill:
+        logging.error("Only one of --wait and --kill should be used at a time.")
+        sys.exit(-1)
+
+    options = {
+        "wait": args.wait,
+        "kill": args.kill
+    }
+
+    for ip in args.ip:
+        communicate(data_dir, commands_fifo_path, {
+            "type": "remove_slave",
+            "ip": ip,
+            "options": options
+        })
+
+
 def status(parser: ArgumentParser):
     args = parser.parse_args()
     data_dir = args.server_data_dir
@@ -452,11 +551,28 @@ def status(parser: ArgumentParser):
     print(json.dumps(resp, ensure_ascii=False, indent=2))
 
 
+def load_status(parser: ArgumentParser):
+    parser = ArgumentParser(description="Load status from a JSON file.", parents=[parser])
+    parser.add_argument("file", type=str)
+    args = parser.parse_args()
+    data_dir = args.server_data_dir
+    commands_fifo_path = os.path.join(data_dir, "commands_fifo")
+    if not os.path.exists(commands_fifo_path):
+        logging.error(
+            "{commands_fifo_path} does not exists. Try starting a server with `python3 cli.py start`")
+        sys.exit(-1)
+
+    communicate(data_dir, commands_fifo_path, {
+        "type": "load_status",
+        "file": args.file
+    })
+
+
 if __name__ == "__main__":
     parser = ArgumentParser(
         description="Scheduler service command line interface.", add_help=False)
     parser.add_argument("action", type=str, default="status",
-                        help="One of start/stop/status/add_job/add_slave")
+                        help="One of start/stop/status/add_job/add_slave/remove_slave/load_status")
     parser.add_argument("--server_data_dir", type=str, default=".data")
 
     main_parser = ArgumentParser(parents=[parser])
@@ -476,5 +592,9 @@ if __name__ == "__main__":
         remove_job(parser)
     elif action == "add_slave":
         add_slave(parser)
+    elif action == "remove_slave":
+        remove_slave(parser)
+    elif action == "load_status":
+        load_status(parser)
     else:
         parser.print_help()
