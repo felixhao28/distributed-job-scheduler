@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
+import argparse
 import sys
 import subprocess
 import os
 import logging
 import json
 from collections import deque
-from typing import List
+from typing import Dict, List, Tuple
 import time
 import threading
 import pickle
@@ -28,7 +29,7 @@ class ServerContext:
 
     def __init__(self, data_dir: str, logs_dir: str) -> None:
         self.slaves = []  # type: List[Slave]
-        self.job_waitlist = deque()  # type: deque[List[str]]
+        self.job_waitlist = deque()  # type: deque[Tuple[List[str], List[str]]]
         self.lock = threading.RLock()
         self.should_stop = False
         self.logs_dir = logs_dir
@@ -36,7 +37,7 @@ class ServerContext:
             data_dir, "server_context.pkl")
         self._load()
 
-    def add_job(self, args: List[str]):
+    def add_job(self, args: List[str], envs: List[str]):
         """
         Adds a job to wait list
 
@@ -46,7 +47,7 @@ class ServerContext:
             E.g. ["job.sh", "data.txt", "data2.txt"] will be run as "./job.sh data.txt data2.txt".
         """
         with self.lock:
-            self.job_waitlist.append(args)
+            self.job_waitlist.append((args, envs))
             self._save()
             slave = self.schedule()
             if len(self.job_waitlist) > 0:
@@ -56,16 +57,16 @@ class ServerContext:
             else:
                 return {"msg": "ServerContext.add_job: This should never be reached."}
 
-    def remove_job(self, args: List[str]):
+    def remove_job(self, args: List[str], envs: List[str]):
         with self.lock:
             try:
-                self.job_waitlist.remove(args)
+                self.job_waitlist.remove((args, envs))
                 self._save()
                 return {"msg": "The job is removed from waitlist"}
             except Exception as e:
                 return {"msg": f"Failed to remove the job from waitlist: {str(e)}"}
 
-    def add_slave(self, ip: str):
+    def add_slave(self, ip: str, envs: List[str]):
         """Register a slave
 
         Args:
@@ -75,7 +76,7 @@ class ServerContext:
             for slave in self.slaves:
                 if slave.ip == ip:
                     return {"err": f"{ip} is already added"}
-            self.slaves.append(Slave(ip, self))
+            self.slaves.append(Slave(ip, envs, self))
             self._save()
             self.schedule()
         return {"msg": "ok"}
@@ -122,13 +123,13 @@ class ServerContext:
         self.job_waitlist = deque(j["job_waitlist"])
         self.slaves = []
         for slave in j["slaves"]:
-            s = Slave(slave["ip"], self)
+            s = Slave(slave["ip"], slave["envs"], self)
             s.status = slave["status"]
             if "remove_after_finish" in slave:
                 s.remove_after_finish = slave["remove_after_finish"]
             job_info = slave["running_job"]
             if job_info is not None:
-                s.running_job = JobInfo(job_info["id"], job_info["script"], job_info["pid"], job_info["log_file"])
+                s.running_job = JobInfo(job_info["id"], job_info["envs"], job_info["script"], job_info["pid"], job_info["log_file"])
                 s.monitor()
             self.slaves.append(s)
         self._save()
@@ -164,7 +165,7 @@ class ServerContext:
                     if slave.status == "idle":
                         hasIdleSlave = True
                         job = self.job_waitlist.popleft()
-                        slave.run(job)
+                        slave.run(*job)
                         break
                 if not hasIdleSlave:
                     break
@@ -175,6 +176,7 @@ class ServerContext:
             "job_waitlist": list(self.job_waitlist),
             "slaves": [{
                 "ip": slave.ip,
+                "envs": slave.envs,
                 "status": slave.status,
                 "running_job": slave.running_job,
                 **({"remove_after_finish": slave.remove_after_finish} if slave.remove_after_finish else {})
@@ -193,9 +195,10 @@ def check_pid(pid):
 
 
 class JobInfo:
-    def __init__(self, id: str, script: str, pid: int, log_file: str) -> None:
+    def __init__(self, id: str, script: str, envs: Dict[str, str], pid: int, log_file: str) -> None:
         self.id = id
         self.script = script
+        self.envs = envs
         self.pid = pid
         self.log_file = log_file
 
@@ -211,10 +214,24 @@ class JobInfo:
     {subprocess.run(["tail", "-n", "10", self.log_file]).stdout.decode("utf-8")}
 """
 
+def parse_key_values(envs):
+    envs_dict = {}
+    for env_str in envs:
+        try:
+            k, v = env_str.split("=")
+            if k in ["JOB_ID", "SLAVE_IP"]:
+                raise ValueError(f"Environment name {k} is reserved.")
+            if k in envs_dict:
+                logging.warn(f"Environment name {k} is duplicated. The new value {v} will overwrite its previous value {envs_dict[k]}.")
+            envs_dict[k] = v
+        except:
+            raise ValueError(f"Failed to parse environment key-value pair: {env_str}. Every environment variable must be set as <NAME>=<VALUE>.")
+    return envs_dict
 
 class Slave:
-    def __init__(self, ip, ctx: ServerContext) -> None:
+    def __init__(self, ip, envs, ctx: ServerContext) -> None:
         self.ip = ip
+        self.envs = parse_key_values(envs)
         self.status = "idle"
         self.running_job = None  # type: JobInfo
         self.ctx = ctx
@@ -222,7 +239,7 @@ class Slave:
         self.remove_after_finish = False
         self._shutdown_event = threading.Event()
 
-    def run(self, job_script: List[str]):
+    def run(self, job_script: List[str], envs: List[str]):
         """Assign a job to this idle slave
 
         Args:
@@ -239,11 +256,15 @@ class Slave:
         subprocess.run(["mkdir", "-p", self.ctx.logs_dir])
         log_file = os.path.join(self.ctx.logs_dir, f"job_{job_id}.txt")
         log_file = log_file.replace(" ", "\\ ")
-        proc = subprocess.Popen(" ".join(job_script) + f" >{log_file} 2>&1", env={
+        job_envs = parse_key_values(envs)
+        envs_dict = {
             "JOB_ID": job_id,
-            "SLAVE_IP": self.ip
-        }, shell=True, start_new_session=True)
-        self.running_job = JobInfo(job_id, job_script, proc.pid, log_file)
+            "SLAVE_IP": self.ip,
+            **self.envs,
+            **job_envs
+        }
+        proc = subprocess.Popen(" ".join(job_script) + f" >{log_file} 2>&1", env=envs_dict, shell=True, start_new_session=True)
+        self.running_job = JobInfo(job_id, job_envs, job_script, proc.pid, log_file)
         self.monitor(proc)
         self.ctx._save()
 
@@ -311,12 +332,12 @@ def _process_waiter(pid, slave: Slave, proc: subprocess.Popen):
     slave.ctx.schedule()
 
 
-def start(base_parser):
+def start(base_args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
     parser = ArgumentParser(
-        description="Start the scheduler service.", parents=[base_parser])
+        description="Start the scheduler service.")
     parser.add_argument("--log_dir", type=str, default="logs")
-    args = parser.parse_args()
-    data_dir = args.server_data_dir
+    args = parser.parse_args(rest_args)
+    data_dir = base_args.server_data_dir
     logs_dir = args.log_dir
     subprocess.run(["mkdir", "-p", data_dir])
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
@@ -347,7 +368,7 @@ def start(base_parser):
 
     ensure_fifo()
     threading.Thread(name="print status", target=status,
-                     args=[base_parser]).start()
+                     args=[base_args, [], []]).start()
 
     ctx.schedule()
     while not ctx.should_stop:
@@ -365,13 +386,13 @@ def start(base_parser):
                     ctx.shutdown()
                     resp = {"msg": "Stopped"}
                 elif cmd['type'] == 'add_job':
-                    resp = ctx.add_job(cmd['args'])
+                    resp = ctx.add_job(cmd['args'], cmd['envs'])
                 elif cmd['type'] == 'add_slave':
-                    resp = ctx.add_slave(cmd['ip'])
+                    resp = ctx.add_slave(cmd['ip'], cmd['envs'])
                 elif cmd['type'] == 'status':
                     resp = ctx.toJSON()
                 elif cmd['type'] == 'remove_job':
-                    resp = ctx.remove_job(cmd['args'])
+                    resp = ctx.remove_job(cmd['args'], cmd['envs'])
                 elif cmd['type'] == 'remove_slave':
                     resp = ctx.remove_slave(cmd['ip'], cmd['options'])
                 elif cmd['type'] == 'load_status':
@@ -414,9 +435,8 @@ def communicate(data_dir, commands_fifo_path, obj):
     return fifo.done()
 
 
-def stop(parser: ArgumentParser):
-    args = parser.parse_args()
-    data_dir = args.server_data_dir
+def stop(base_args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
+    data_dir = base_args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     if not os.path.exists(commands_fifo_path):
         logging.error(
@@ -428,9 +448,12 @@ def stop(parser: ArgumentParser):
     })
 
 
-def add_job(parser: ArgumentParser):
-    args, rest_args = parser.parse_known_args()
-    data_dir = args.server_data_dir
+def add_job(base_args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
+    parser = ArgumentParser(description="Add a job")
+    parser.add_argument("--env,-e", type=str, nargs='*',
+                        help="Set additional environment variable to the job script.")
+    args, rest_args = parser.parse_known_args(rest_args)
+    data_dir = base_args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     if not os.path.exists(commands_fifo_path):
         logging.error(
@@ -450,13 +473,17 @@ def add_job(parser: ArgumentParser):
 
     communicate(data_dir, commands_fifo_path, {
         "type": "add_job",
-        "args": rest_args
+        "args": rest_args + user_args,
+        "envs": args.env if 'env' in args else []
     })
 
 
-def remove_job(parser: ArgumentParser):
-    args, rest_args = parser.parse_known_args()
-    data_dir = args.server_data_dir
+def remove_job(base_args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
+    parser = ArgumentParser(description="Remove a job")
+    parser.add_argument("--env,-e", type=str, nargs='*',
+                        help="Set additional environment variable to the job script.")
+    args, rest_args = parser.parse_known_args(rest_args)
+    data_dir = base_args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     if not os.path.exists(commands_fifo_path):
         logging.error(
@@ -472,18 +499,21 @@ def remove_job(parser: ArgumentParser):
 
     communicate(data_dir, commands_fifo_path, {
         "type": "remove_job",
-        "args": rest_args
+        "args": rest_args + user_args,
+        "envs": args.env if 'env' in args else []
     })
 
 
-def add_slave(parser: ArgumentParser):
-    parser = ArgumentParser(description="Add a slave.", parents=[parser])
+def add_slave(base_args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
+    parser = ArgumentParser(description="Add a slave.")
     parser.add_argument("ip", type=str, nargs='+',
                         help="IP addresses of the slaves")
     parser.add_argument("--skip_ssh_auth_check", action="store_true",
                         help="Whether to skip the check of slave supporting ssh no-password authentication.")
-    args = parser.parse_args()
-    data_dir = args.server_data_dir
+    parser.add_argument("--env,-e", type=str, nargs='*',
+                        help="Set additional environment variable to the job script when executing on this slave.")
+    args = parser.parse_args(rest_args)
+    data_dir = base_args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     if not os.path.exists(commands_fifo_path):
         logging.error(
@@ -502,17 +532,18 @@ def add_slave(parser: ArgumentParser):
         communicate(data_dir, commands_fifo_path, {
             "type": "add_slave",
             "ip": ip,
+            "envs": args.env if 'env' in args else []
         })
 
 
-def remove_slave(parser: ArgumentParser):
-    parser = ArgumentParser(description="Remove a slave.", parents=[parser])
+def remove_slave(base_args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
+    parser = ArgumentParser(description="Remove a slave.")
     parser.add_argument("ip", type=str, nargs='+',
                         help="IP addresses of the slaves")
     parser.add_argument("--wait", action="store_true")
     parser.add_argument("--kill", action="store_true")
-    args = parser.parse_args()
-    data_dir = args.server_data_dir
+    args = parser.parse_args(rest_args)
+    data_dir = base_args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     if not os.path.exists(commands_fifo_path):
         logging.error(
@@ -536,8 +567,7 @@ def remove_slave(parser: ArgumentParser):
         })
 
 
-def status(parser: ArgumentParser):
-    args = parser.parse_args()
+def status(args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
     data_dir = args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     if not os.path.exists(commands_fifo_path):
@@ -551,11 +581,11 @@ def status(parser: ArgumentParser):
     print(json.dumps(resp, ensure_ascii=False, indent=2))
 
 
-def load_status(parser: ArgumentParser):
-    parser = ArgumentParser(description="Load status from a JSON file.", parents=[parser])
+def load_status(base_args: argparse.Namespace, rest_args: List[str], user_args: List[str]):
+    parser = ArgumentParser(description="Load status from a JSON file.")
     parser.add_argument("file", type=str)
-    args = parser.parse_args()
-    data_dir = args.server_data_dir
+    args = parser.parse_args(rest_args)
+    data_dir = base_args.server_data_dir
     commands_fifo_path = os.path.join(data_dir, "commands_fifo")
     if not os.path.exists(commands_fifo_path):
         logging.error(
@@ -569,6 +599,14 @@ def load_status(parser: ArgumentParser):
 
 
 if __name__ == "__main__":
+    argv = sys.argv[1:]
+    try:
+        force_stop_index = argv.index("--")
+        argv = argv[: force_stop_index]
+        user_args = argv[force_stop_index + 1:]
+    except ValueError:
+        force_stop_index = -1
+        user_args = []
     parser = ArgumentParser(
         description="Scheduler service command line interface.", add_help=False)
     parser.add_argument("action", type=str, default="status",
@@ -577,24 +615,24 @@ if __name__ == "__main__":
 
     main_parser = ArgumentParser(parents=[parser])
 
-    args, _ = main_parser.parse_known_args()
+    args, rest_args = main_parser.parse_known_args(sys.argv[1:])
     action = args.action
     logging.basicConfig(level=logging.INFO)
     if action == "status":
-        status(parser)
+        status(args, rest_args, user_args)
     elif action == "start":
-        start(parser)
+        start(args, rest_args, user_args)
     elif action == "stop":
-        stop(parser)
+        stop(args, rest_args, user_args)
     elif action == "add_job":
-        add_job(parser)
+        add_job(args, rest_args, user_args)
     elif action == "remove_job":
-        remove_job(parser)
+        remove_job(args, rest_args, user_args)
     elif action == "add_slave":
-        add_slave(parser)
+        add_slave(args, rest_args, user_args)
     elif action == "remove_slave":
-        remove_slave(parser)
+        remove_slave(args, rest_args, user_args)
     elif action == "load_status":
-        load_status(parser)
+        load_status(args, rest_args, user_args)
     else:
         parser.print_help()

@@ -69,7 +69,7 @@ screen -S scheduler
 A worker is a minimal job processing unit, which usually means a node in a cluster.
 
 ```bash
-./cli.py add_slave [--skip_ssh_auth_check] <ip_1> [<ip_2>] ...
+./cli.py add_slave [--server_data_dir=<server_data_dir>] [--skip_ssh_auth_check] [--env,-e=<NAME>=<VALUE>] <ip_1> [<ip_2>] ...
 ```
 
 Example:
@@ -80,7 +80,59 @@ Example:
 ```
 
 Since you have the full control of the job script, you don't have to use IP addresses. However, it needs to be unique for each worker.
-In this case, `--skip_ssh_auth_check` is required to skip the SSH no-password check.
+In this case, `--skip_ssh_auth_check` is required to skip the SSH no-password check. For example, you can totally write something like this:
+
+```bash
+# This adds three workers to the list
+./cli.py add_slave user1@199:1000 user2@200:1001 user3@201:1002
+```
+
+And use them in the script like:
+
+```bash
+# SLAVE_IP=user1@199:1000
+# Now use some shell magic to extract propriate parts
+USER=${SLAVE_IP%%@*} # user1
+PORT=${SLAVE_IP##*:} # 1000
+IP=${SLAVE_IP:${#USER} + 1: ${#PORT} - 1} # 199
+ssh -t -t $USER@192.168.1.$IP -p $PORT "wc /root/$1.txt > /root/$JOB_ID.out"
+```
+
+A probably more readable way of doing this is to use `--env` argument:
+
+```bash
+# This adds three workers to the list
+./cli.py add_slave -e USER=user1 -e PORT=1000 199
+./cli.py add_slave -e USER=user2 -e PORT=1001 200
+./cli.py add_slave -e USER=user3 -e PORT=1002 201
+
+echo job.sh
+# ssh -t -t $USER@192.168.1.$SLAVE_IP -p $PORT "wc /root/$1.txt > /root/$JOB_ID.out"
+```
+
+Or add the workers to the SSH configuration file (~/.ssh/config):
+
+```
+Host 199
+    HostName 192.168.1.199
+    Port 1000
+    User user1
+Host 200
+    HostName 192.168.1.200
+    Port 1001
+    User user2
+Host 201
+    HostName 192.168.1.201
+    Port 1002
+    User user3
+```
+
+```bash
+./cli.py add_slave 199 200 201
+
+echo job.sh
+# ssh -t -t $SLAVE_IP "wc /root/$1.txt > /root/$JOB_ID.out"
+```
 
 Note: you cannot interact with your job script in the command line. So it is best to [ensure no password is needed to ssh into the worker](https://www.ssh.com/academy/ssh/copy-id).
 
@@ -98,7 +150,7 @@ It is your responsibility to handle the `SIGTERM` signal in your script to stop 
 A job consists of the script name and its arguments.
 
 ```bash
-./cli.py add_job <script> <args1> <args2> ...
+./cli.py add_job [--server_data_dir=<server_data_dir>] [--env,-e=<NAME>=<VALUE>] <script> <args1> <args2> ...
 ```
 
 Example
@@ -108,12 +160,18 @@ Example
 ```
 
 Each time a job is added or a worker becomes idle, the scheduler will assign a job from the waiting list to an idle worker.
+If all workers are busy, the scheduler will add the job to a waiting list.
+The user can use `--env` to specify additional environment variables for the script. `--env` can be used multiple times.
 
-If all workers are busy, the scheduler will add the job to a waiting list. The user can remove jobs in the waiting list by specifying the same script and arguments.
+The script does not need to be a shell script. Any executable file works.
+
+In the case of an argument passed to your script have the conflicting name with `--server_data_dir`.
+
+The user can remove jobs in the waiting list by specifying the same script and arguments.
 If multiple jobs share the same script and arguments, all of them will be removed.
 
 ```bash
-./cli.py remove_job <script> <args1> <args2> ...
+./cli.py remove_job [--server_data_dir=<server_data_dir>] <script> <args1> <args2> ...
 ```
 
 ### Check/load the status
@@ -121,7 +179,7 @@ If multiple jobs share the same script and arguments, all of them will be remove
 This prints the status of all the awaiting jobs and workers to the console.
 
 ```bash
-./cli.py status
+./cli.py [--server_data_dir=<server_data_dir>] status
 ```
 
 It prints a json object like this:
@@ -166,7 +224,7 @@ It prints a json object like this:
 In case of needing manually editing the status of the scheduler, save the above json into a file, edit it, and then load it with `load_status` action.
 
 ```bash
-./cli.py load_status </path/to/status_json_file>
+./cli.py [--server_data_dir=<server_data_dir>] load_status </path/to/status_json_file>
 ```
 
 Note: this will erase the existing status of the scheduler.
@@ -174,7 +232,7 @@ Note: this will erase the existing status of the scheduler.
 ### Stop the server
 
 ```bash
-./cli.py stop
+./cli.py [--server_data_dir=<server_data_dir>] stop
 ```
 
 Stopping the server does not kill all running jobs. It will just kill the scheduler.
